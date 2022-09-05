@@ -31,6 +31,11 @@ bool send_stats_force = false;
 // to many of the below arrays, too.
 int num_sensors = 4;
 
+// overflow sensor - it assumes to be num_sensors + 1
+bool overflow_enabled = true;
+
+bool force_pump_shutdown = false;
+
 // set water pump
 int pump_pin = 4;
 
@@ -127,7 +132,14 @@ void read_value()
   ...
  **********************************************************/
   /************These is for capacity moisture sensor*********/
-  for (int i = 0; i < num_sensors; i++)
+
+  int loop_count = num_sensors;
+  if(overflow_enabled)
+  {
+    loop_count++;
+  }
+
+  for (int i = 0; i < loop_count; i++)
   {
     float value = analogRead(moisture_pins[i]);
 
@@ -153,9 +165,21 @@ void read_value()
 
 void water_flower()
 {
+  force_pump_shutdown = false;
+  if(water_level_enabled)
+  {
+    // reservoir is empty?
+    force_pump_shutdown |= water_level_mm < 0;
+  }
+  if(overflow_enabled)
+  {
+    // overflow?
+    force_pump_shutdown |= moisture_values[num_sensors] > OVERFLOW_TRIGGER_THRESHOLD;
+  }
+
   for (int i = 0; i < num_sensors; i++)
   {
-    if (moisture_values[i] < WATER_START_VALUE)
+    if (moisture_values[i] < WATER_START_VALUE && !force_pump_shutdown)
     {
       digitalWrite(valve_pins[i], HIGH);
       if (valve_state_flags[i] != 1) 
@@ -171,7 +195,7 @@ void water_flower()
         delay(50);
       }
     }
-    else if (moisture_values[i] > WATER_STOP_VALUE)
+    else if (moisture_values[i] > WATER_STOP_VALUE || force_pump_shutdown)
     {
       if (valve_state_flags[i] != 0) 
       {
@@ -261,7 +285,7 @@ void send_stats_serial(Stream &port)
 void send_stats() {
   unsigned long now = millis();
   unsigned long millisSinceLastRun = now - send_stats_last;
-  
+
 #ifdef SEND_STATS_MQTT
   dtostrf(millisSinceLastRun, 9, 0, output_buffer);
   Serial1.print("#Millis since last run ");
@@ -269,21 +293,19 @@ void send_stats() {
   Serial1.print("\n");
 #endif
 
-  if (millisSinceLastRun > SEND_STATS_FREQ_MS) {
-    // TODO: There is some issue that this isn't ever being triggered.
-    send_stats_force = true;
+  if (millisSinceLastRun < SEND_STATS_FREQ_MS) {
+    // not ready yet
+    return;
   }
-  if (send_stats_force)
-  {
-    send_stats_last = now;
-    send_stats_force = false;
+
+  send_stats_last = now;
+  send_stats_force = false;
 #ifdef SEND_STATS_LOCAL
-    send_stats_serial(Serial);
+  send_stats_serial(Serial);
 #endif
 #ifdef SEND_STATS_MQTT
-    send_stats_serial(Serial1);
+  send_stats_serial(Serial1);
 #endif
-  }
 }
 
 void draw_stats()

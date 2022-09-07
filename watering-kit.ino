@@ -29,7 +29,7 @@ bool send_stats_force = false;
 
 // The number of sensors. If you want more, you will need
 // to many of the below arrays, too.
-int num_sensors = 4;
+const int num_sensors = 1;
 
 // overflow sensor - it assumes to be num_sensors + 1
 bool overflow_enabled = true;
@@ -37,25 +37,32 @@ bool overflow_enabled = true;
 bool force_pump_shutdown = false;
 
 // set water pump
-int pump_pin = 4;
+const int pump_pin = 4;
 
 // set button
-int button_pin = 12;
+const int button_pin = 12;
 
 // set water valve pins
-int valve_pins[] = {6, 8, 9, 10};
+const int valve_pins[] = {6, 8, 9, 10};
 
 // set all moisture sensors PIN ID
-int moisture_pins[] = {A0, A1, A2, A3};
+const int moisture_pins[] = {A0, A1, A2, A3};
 
 // declare moisture values
 int moisture_values[] = {0, 0, 0, 0};
 
-//valve states    1:open   0:close
-int valve_state_flags[] = {0, 0, 0, 0};
+enum PUMP_VALVE_STATE {CLOSED = 0, OPEN = 1};
 
-//pump state    1:open   0:close
-int pump_state_flag = 0;
+//valve states    1:open   0:closed
+PUMP_VALVE_STATE valve_state_flags[] = {CLOSED, CLOSED, CLOSED, CLOSED};
+
+//pump state    1:open   0:closed
+PUMP_VALVE_STATE pump_state_flag = CLOSED;
+
+// cooldown
+DateTime cooldown_until[] = {DateTime((uint32_t)0), DateTime((uint32_t)0), DateTime((uint32_t)0), DateTime((uint32_t)0)};
+DateTime water_cutoff_at[] = {DateTime((uint32_t)0), DateTime((uint32_t)0), DateTime((uint32_t)0), DateTime((uint32_t)0)};
+bool run_water[] = {false, false, false, false};
 
 // Water level
 bool water_level_enabled = false;
@@ -69,12 +76,16 @@ long mostWetSensorValue[] = WET_VALUES
 
 static char output_buffer[10];
 
+const int COL_WIDTH = 32;
+const int x_offsets[] = {COL_WIDTH*0, COL_WIDTH*1, COL_WIDTH*2, COL_WIDTH*3};
+
 void setup()
 {
   Wire.begin();
   RTC.begin();
-
   Serial.begin(19200);
+
+  debugf("setup()\n");
   
 #ifdef SEND_STATS_MQTT
   // Serial to ESP8266. Use RX & TX pins of Elecrow watering board
@@ -83,10 +94,15 @@ void setup()
 #endif
 
   u8g2.begin();
+  DateTime now = RTC.now();
   // declare valve relays as output
   for (int i = 0; i < num_sensors; i++)
   {
     pinMode(valve_pins[i], OUTPUT);
+    // init cooldown timers
+    // and a bonus: delay first pump, giving sensors a warm-up period
+    cooldown_until[i] = now + TimeSpan((int32_t)COOLDOWN_PERIOD_SECONDS);
+    water_cutoff_at[i] = now;
   }
   // declare pump as output
   pinMode(pump_pin, OUTPUT);
@@ -120,7 +136,7 @@ void loop()
   {
     draw_stats();
   } while (u8g2.nextPage());
-  delay(1000);
+  delay(200);
 }
 
 //Set moisture value
@@ -153,12 +169,8 @@ void read_value()
     }    
 
     // Conver mosisture readings to 0-100 percentage.
-    moisture_values[i] = map(value, 
-        mostDrySensorValue[i], mostWetSensorValue[i], 0, 100);
-    if (moisture_values[i] < 0)
-    {
-      moisture_values[i] = 0;
-    }
+    moisture_values[i] = max(0, min(100, map(value, 
+        mostDrySensorValue[i], mostWetSensorValue[i], 0, 100)));
     delay(20);
   }
 }
@@ -177,50 +189,101 @@ void water_flower()
     force_pump_shutdown |= moisture_values[num_sensors] > OVERFLOW_TRIGGER_THRESHOLD;
   }
 
+  // assume all valves should be closed, and that we should not run the pump
+  PUMP_VALVE_STATE desired_state[] = {CLOSED, CLOSED, CLOSED, CLOSED};
+  PUMP_VALVE_STATE desired_pump_state = CLOSED;
+
+  DateTime now = RTC.now();
   for (int i = 0; i < num_sensors; i++)
   {
-    if (moisture_values[i] < WATER_START_VALUE && !force_pump_shutdown)
+    debugf(" currently: %s", valve_state_flags[i] == OPEN ? "OPEN" : "CLOSED");
+    debugf(" cooldown: %" PRIu32, cooldown_until[i].unixtime());
+    debugf(" water_cutoff_at: %" PRIu32, water_cutoff_at[i].unixtime());
+    debugf(" moisture_values: %d", moisture_values[i]);
+    debugf(" now: %" PRIu32, now.unixtime());
+    debugf("\n");
+
+    if (force_pump_shutdown) {
+      debugf("Forced shutdown mode\n");
+      continue;
+    }
+
+    if (valve_state_flags[i] == CLOSED)
     {
-      digitalWrite(valve_pins[i], HIGH);
-      if (valve_state_flags[i] != 1) 
+      // see if we should turn on
+      if (moisture_values[i] < WATER_START_VALUE)
       {
-        valve_state_flags[i] = 1;
-        send_stats_force = true;
+        run_water[i] = true;
       }
-      delay(50);
-      if (pump_state_flag == 0)
+
+      if (run_water[i] && cooldown_until[i] <= now)
       {
-        digitalWrite(pump_pin, HIGH);
-        pump_state_flag = 1;
-        delay(50);
+        debugf("Setting OPEN %d\n", i);
+        desired_state[i] = OPEN;
+        desired_pump_state = OPEN;
       }
     }
-    else if (moisture_values[i] > WATER_STOP_VALUE || force_pump_shutdown)
+    else
     {
-      if (valve_state_flags[i] != 0) 
+      // see if we should stay on
+      if (moisture_values[i] > WATER_STOP_VALUE)
       {
-        // Only report if it IS on
-        send_stats_force = true;
-        valve_state_flags[i] = 0;
+        run_water[i] = false;
       }
-      // Force it off
-      digitalWrite(valve_pins[i], LOW);
-      delay(50);
+      if (run_water[i] && water_cutoff_at[i] > now)
+      {
+        debugf("Leaving OPEN %d\n", i);
+        desired_state[i] = OPEN;
+        desired_pump_state = OPEN;
+      }
     }
   }
 
-  // If no more active valves, shut down the pump.
-  int num_active_valves = 0;
-  for (int i = 0; i < num_sensors; i++)
+  // always stop the pump before closing valves
+  if(pump_state_flag == OPEN && desired_pump_state == CLOSED)
   {
-    num_active_valves += (valve_state_flags[i] > 0) ? 1 : 0;
-  }
-  if (num_active_valves == 0)
-  {
+    debugf("Stop pump\n");
     digitalWrite(pump_pin, LOW);
-    pump_state_flag = 0;
+    pump_state_flag = CLOSED;
     delay(50);
   }
+
+  bool valves_changed = false;
+  for (int i = 0; i < num_sensors; i++)
+  {
+    if (valve_state_flags[i] != desired_state[i])
+    {
+      debugf("Changing valve %d to %s\n", i, desired_state[i] == OPEN ? "OPEN" : "CLOSED");
+
+      valves_changed = true;
+      if(desired_state[i] == OPEN)
+      {        
+        water_cutoff_at[i] = now + TimeSpan((int32_t)MAX_WATERING_LENGTH_SECONDS);
+        digitalWrite(valve_pins[i], HIGH);
+      }
+      else if (desired_state[i] == CLOSED)
+      {
+        cooldown_until[i] = now + TimeSpan((int32_t)COOLDOWN_PERIOD_SECONDS);
+        digitalWrite(valve_pins[i], LOW);
+      }
+
+      valve_state_flags[i] = desired_state[i];
+      send_stats_force = true;
+    }
+  }
+
+  if (pump_state_flag == CLOSED && desired_pump_state == OPEN)
+  {
+    if(valves_changed)
+    {
+      delay(50);  // give the valves time to change before engaging the pump
+    }
+    debugf("Start pump\n");
+    digitalWrite(pump_pin, HIGH);
+    pump_state_flag = OPEN;
+  }
+
+  debugf("\n");
 }
 
 void check_water_level()
@@ -247,7 +310,7 @@ void check_water_level()
 }
 
 void send_stats_serial(Stream &port)
-{  
+{
   for (int i = 0; i < num_sensors; i++)
   {
     /*********Output Moisture Sensor values to ESP8266******/
@@ -310,8 +373,9 @@ void send_stats() {
 
 void draw_stats()
 {
-  int x_offsets[] = {0, 32, 64, 96};
-  char display_buffer[5] = {0};
+  DateTime now = RTC.now();
+  const int DISPLAY_BUFFER_SIZE = 5;
+  char display_buffer[DISPLAY_BUFFER_SIZE] = {0};
 
   u8g2.setFont(u8g2_font_8x13_tr);
   u8g2.setCursor(9, 60);
@@ -333,22 +397,68 @@ void draw_stats()
 
   for (int i = 0; i < num_sensors; i++)
   {
-    itoa(moisture_values[i], display_buffer, 10);
-    if (moisture_values[i] < 10)
+    // moisture level, right-justified
+    sprintf(display_buffer, "%d%%", moisture_values[i]);
+    u8g2DrawStrRightJustifiedClearPrefix(x_offsets[0], x_offsets[0] + COL_WIDTH, 45 - 15 * i, display_buffer);
+
+
+    // hold state
+    DateTime until;
+    if(valve_state_flags[i] == OPEN)
     {
-      u8g2.drawStr(x_offsets[i] + 14, 45, display_buffer);
+      until = water_cutoff_at[i];
+    } else {
+      until = cooldown_until[i];
     }
-    else if (moisture_values[i] < 100)
+
+    TimeSpan secs_remaining = until - now;
+    char run_water_indicator = '-';
+    if (run_water[i])
     {
-      u8g2.drawStr(x_offsets[i] + 5, 45, display_buffer);
+      sprintf(display_buffer, "%" PRId32, secs_remaining.totalseconds());
+      run_water_indicator = valve_state_flags[i] == OPEN ? 'W' : 'H';
     }
     else
     {
-      moisture_values[i] = 100;
-      itoa(moisture_values[i], display_buffer, 10);
-      u8g2.drawStr(x_offsets[i] + 2, 45, display_buffer);
+      // clear countdown area
+      display_buffer[0] = '\0';
     }
-    u8g2.setCursor(x_offsets[i] + 23, 45);
-    u8g2.print("%");
+    u8g2DrawStrRightJustifiedClearPrefix(x_offsets[2], x_offsets[2] + COL_WIDTH, 45 - 15 * i, display_buffer);
+
+    sprintf(display_buffer, "%c%c", run_water_indicator, force_pump_shutdown ? 'V' : '-');
+    u8g2DrawStrRightJustifiedClearPrefix(x_offsets[3], x_offsets[3] + COL_WIDTH, 45 - 15 * i, display_buffer);
   }
+}
+
+void u8g2DrawStrRightJustifiedClearPrefix(u8g2_uint_t left, u8g2_uint_t right, u8g2_uint_t bottom, const char *s)
+{
+    int width = u8g2.getStrWidth(s);
+    int height = 15; //u8g2.getMaxCharHeight();
+    int oldDrawColor = u8g2.getDrawColor();
+
+    // draw the blank area before the string
+    u8g2.setDrawColor(0);
+    // drawStr y is bottom edge, but drawBox y is top edge
+    u8g2.drawBox(left, bottom - height, width, height);
+
+    // now draw the 
+    u8g2.setDrawColor(1);
+    u8g2.drawStr(right - width, bottom, s);
+
+    u8g2.setDrawColor(oldDrawColor);
+}
+
+void debugf(char* format, ...)
+{
+  va_list argptr;
+  char buffer[33] = { 0 };
+
+  va_start(argptr,format);
+  #ifndef SEND_STATS_LOCAL
+  vsnprintf(buffer, 32, format, argptr);
+  #endif
+  va_end(argptr);
+  #ifndef SEND_STATS_LOCAL
+  Serial.print(buffer);
+  #endif
 }

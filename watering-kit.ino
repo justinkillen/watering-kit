@@ -53,11 +53,18 @@ int moisture_values[] = {0, 0, 0, 0};
 
 enum PUMP_VALVE_STATE {CLOSED = 0, OPEN = 1};
 
-//valve states    1:open   0:closed
+// valve states    1:open   0:closed
 PUMP_VALVE_STATE valve_state_flags[] = {CLOSED, CLOSED, CLOSED, CLOSED};
 
-//pump state    1:open   0:closed
+// pump state    1:open   0:closed
 PUMP_VALVE_STATE pump_state_flag = CLOSED;
+
+// moisture metrics ring-buffer.  128 slots at 15 minutes each gives us 32 hours of data.
+const int MOISTURE_RINGBUFFER_SLOTS = 128;
+const int MOISTURE_RINGBUFFER_INTERVAL_SECONDS = 15 * 60;
+int moisture_ringbuff[MOISTURE_RINGBUFFER_SLOTS] = {};
+int moisture_ringbuff_current = 0;
+DateTime moisture_ringbuff_advance;
 
 // cooldown
 DateTime cooldown_until[] = {DateTime((uint32_t)0), DateTime((uint32_t)0), DateTime((uint32_t)0), DateTime((uint32_t)0)};
@@ -84,8 +91,17 @@ void setup()
   Wire.begin();
   RTC.begin();
   Serial.begin(19200);
-
+  for(int x=0; x < MOISTURE_RINGBUFFER_SLOTS; x++)
+  {
+    moisture_ringbuff[x] = -1;
+  }
   debugf("setup()\n");
+
+  // // fill ringbuffer
+  // for (int x=0; x < MOISTURE_RINGBUFFER_SLOTS; x++)
+  // {
+  //   moisture_ringbuff[x] = x;
+  // }
   
 #ifdef SEND_STATS_MQTT
   // Serial to ESP8266. Use RX & TX pins of Elecrow watering board
@@ -112,6 +128,24 @@ void setup()
   setup_water_level_sensor();
 }
 
+void next_ringbuffer()
+{
+  DateTime now = RTC.now();
+  if (now > moisture_ringbuff_advance)
+  {
+    debugf("rolling over to next ringbuffer\n");
+    moisture_ringbuff_advance = RTC.now() + TimeSpan(MOISTURE_RINGBUFFER_INTERVAL_SECONDS);
+    moisture_ringbuff_current++;
+    if (moisture_ringbuff_current >= MOISTURE_RINGBUFFER_SLOTS) {
+      moisture_ringbuff_current = 0;
+    }
+  }
+  else 
+  {
+    moisture_ringbuff[moisture_ringbuff_current] = moisture_values[0];
+  }
+}
+
 void setup_water_level_sensor()
 {
   water_level_enabled = false;
@@ -126,15 +160,16 @@ void setup_water_level_sensor()
 
 void loop()
 {
-  // read the value from the moisture sensors:
   read_value();
   check_water_level();
   water_flower();
+  next_ringbuffer();
   send_stats();
   u8g2.firstPage();
   do
   {
     draw_stats();
+    draw_graph();
   } while (u8g2.nextPage());
   delay(200);
 }
@@ -169,8 +204,10 @@ void read_value()
     }    
 
     // Conver mosisture readings to 0-100 percentage.
-    moisture_values[i] = max(0, min(100, map(value, 
-        mostDrySensorValue[i], mostWetSensorValue[i], 0, 100)));
+    // min/max macros are weird - write to tmp variables
+    int tmp = map(value, mostDrySensorValue[i], mostWetSensorValue[i], 0, 100);
+    int tmp2 = min(100, tmp);
+    moisture_values[i] = max(0, tmp2);
     delay(20);
   }
 }
@@ -430,6 +467,79 @@ void draw_stats()
   }
 }
 
+void draw_graph()
+{
+  // might need to break the calculations out of the draw loop if it takes a long time
+
+  // we have the top half of the screen, roughly 0,0 to 127,31
+  // first, we separate into 3 vertical areas:
+  // start, height, notes
+  //  0,  5,  4, moisture above WATER_STOP_VALUE
+  //  5,  1,  5, line separator
+  //  6, 20, 25, moisture between WATER_START_VALUE and WATER_STOP_VALUE
+  // 26,  1, 26, line separator
+  // 27,  5, 31, moisture below WATER_START_VALUE
+  // total: 32px
+
+  u8g2.setDrawColor(0);
+  u8g2.drawBox(0, 0, 127, 31);
+  u8g2.setDrawColor(1);
+
+  int ringbuff_offset = moisture_ringbuff_current;
+  for (int x = 127; x >= 0; x--)
+  {
+    if (x % 2 == 0)
+    {
+      u8g2.drawPixel(x, 5);
+      u8g2.drawPixel(x, 26);
+    }
+
+    if (moisture_ringbuff[ringbuff_offset] != -1)
+      int bit = calc_graph(moisture_ringbuff[ringbuff_offset]);
+      u8g2.drawPixel(x, bit);
+    }
+
+    ringbuff_offset--;
+    if (ringbuff_offset < 0)
+    {
+      ringbuff_offset = MOISTURE_RINGBUFFER_SLOTS - 1;
+    }
+  }
+}
+
+int calc_graph(int moisture_level)
+{
+  int display_top = 0;
+  int display_height = 0;
+  int percent_range = 0;
+  int percent_in_range = 0;
+
+  if (moisture_level > WATER_STOP_VALUE)
+  {
+    display_top = 0;
+    display_height = 5;
+    percent_range = 100 - WATER_STOP_VALUE;
+    percent_in_range = moisture_level - 1 - WATER_STOP_VALUE;
+  }
+  else if (moisture_level >= WATER_START_VALUE && moisture_level <= WATER_STOP_VALUE)
+  {
+    display_top = 6;
+    display_height = 20;
+    percent_range = WATER_STOP_VALUE - WATER_START_VALUE - 1;
+    percent_in_range = moisture_level - 1 - WATER_START_VALUE;
+  }
+  else if (moisture_level < WATER_START_VALUE)
+  {
+    display_top = 27;
+    display_height = 5;
+    percent_range = WATER_START_VALUE;
+    percent_in_range = moisture_level;
+  }
+
+  int display_bottom = display_top + display_height - 1;
+  return display_bottom - (int)(1.0 * percent_in_range * display_height / percent_range);
+}
+
 void u8g2DrawStrRightJustifiedClearPrefix(u8g2_uint_t left, u8g2_uint_t right, u8g2_uint_t bottom, const char *s)
 {
     int width = u8g2.getStrWidth(s);
@@ -451,11 +561,11 @@ void u8g2DrawStrRightJustifiedClearPrefix(u8g2_uint_t left, u8g2_uint_t right, u
 void debugf(char* format, ...)
 {
   va_list argptr;
-  char buffer[33] = { 0 };
+  char buffer[129] = { 0 };
 
   va_start(argptr,format);
   #ifndef SEND_STATS_LOCAL
-  vsnprintf(buffer, 32, format, argptr);
+  vsnprintf(buffer, 128, format, argptr);
   #endif
   va_end(argptr);
   #ifndef SEND_STATS_LOCAL

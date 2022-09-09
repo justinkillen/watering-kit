@@ -34,4 +34,7 @@ Personal restrictions / caveats / comments:
 * Remove flower graphics and splash screen.
 * Use one of the sensors as an overflow detector.
 * Added a max "on" time for the pump and a forced cool-down period.
-* Added an in-memory metrics store for moisture levels and "on" time.  Graph to the display.
+* Added an in-memory metrics store for moisture levels.  Graph to the display.
+
+## To-Do  ##
+* Track / graph when pump is running.

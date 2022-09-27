@@ -48,6 +48,15 @@ const int valve_pins[] = {6, 8, 9, 10};
 // set all moisture sensors PIN ID
 const int moisture_pins[] = {A0, A1, A2, A3};
 
+// declare sensor normalizer buffers.  The sensors seem to give a value +/- some variance,
+// and they fluctuate rapidly.  These buffers are used to normalize that signal into a more
+// consistent value, similar to a debouncer.
+const int SENSOR_NORMALIZER_SLOTS = 8;
+const int SENSOR_NORMALIZER_INTERVAL_MS = 250;
+float sensor_normalizer[4][SENSOR_NORMALIZER_SLOTS];
+int sensor_normalizer_current = 0;
+unsigned long sensor_normalizer_advance = 0;
+
 // declare moisture values
 int moisture_values[] = {0, 0, 0, 0};
 
@@ -61,6 +70,7 @@ PUMP_VALVE_STATE pump_state_flag = CLOSED;
 
 // moisture metrics ring-buffer.  128 slots at 15 minutes each gives us 32 hours of data.
 const int MOISTURE_RINGBUFFER_SLOTS = 128;
+// const int MOISTURE_RINGBUFFER_INTERVAL_SECONDS = 5; // 5 seconds - for testing
 const int MOISTURE_RINGBUFFER_INTERVAL_SECONDS = 15 * 60;
 int moisture_ringbuff[MOISTURE_RINGBUFFER_SLOTS] = {};
 int moisture_ringbuff_current = 0;
@@ -184,6 +194,15 @@ void read_value()
  **********************************************************/
   /************These is for capacity moisture sensor*********/
 
+  // ready for the next value?
+  unsigned long now = millis();
+  if (now < sensor_normalizer_advance)
+  {
+    return;
+  }
+
+  sensor_normalizer_advance = now + SENSOR_NORMALIZER_INTERVAL_MS;
+
   int loop_count = num_sensors;
   if(overflow_enabled)
   {
@@ -192,7 +211,25 @@ void read_value()
 
   for (int i = 0; i < loop_count; i++)
   {
+    // get sensor value
     float value = analogRead(moisture_pins[i]);
+
+    // normalize values (average) to smooth the curve
+    sensor_normalizer[i][sensor_normalizer_current] = value;
+
+    float sum = 0;
+    debugf("normalizer inputs %d: ", i);
+    for (int slot = 0; slot < SENSOR_NORMALIZER_SLOTS; slot++)
+    {
+      dtostrf(sensor_normalizer[i][slot], 4, 0, output_buffer);
+      debugf("%s, ", output_buffer);
+      sum += sensor_normalizer[i][slot];
+    }
+    value = sum / SENSOR_NORMALIZER_SLOTS;
+    dtostrf(sum, 4, 0, output_buffer);
+    debugf("sum: %s", output_buffer);
+    dtostrf(value, 4, 0, output_buffer);
+    debugf("avg: %s\n", output_buffer);
 
     if (value > mostDrySensorValue[i]) {
       // Tune mostDrySensorValue[i] max value
@@ -208,7 +245,12 @@ void read_value()
     int tmp = map(value, mostDrySensorValue[i], mostWetSensorValue[i], 0, 100);
     int tmp2 = min(100, tmp);
     moisture_values[i] = max(0, tmp2);
-    delay(20);
+  }
+
+  sensor_normalizer_current++;
+  if (sensor_normalizer_current >= SENSOR_NORMALIZER_SLOTS)
+  {
+    sensor_normalizer_current = 0;
   }
 }
 
@@ -495,6 +537,7 @@ void draw_graph()
     }
 
     if (moisture_ringbuff[ringbuff_offset] != -1)
+    {
       int bit = calc_graph(moisture_ringbuff[ringbuff_offset]);
       u8g2.drawPixel(x, bit);
     }
